@@ -1,0 +1,379 @@
+
+step1_create_knowledge.py
+1.Configures an Azure AI Search knowledge source pointing to the approved clinical corpus in blob storage.
+2.Uses content extraction and embeddings so the documents can be searched semantically.
+3.Creates a knowledge base linked to that source and set to answer questions only from approved materials with citations.
+4.Waits for ingestion/indexing to finish.
+5.Runs a sample clinical question to verify the retrieval pipeline works correctly.
+6.Supports optional cleanup via --delete and a quick re-test via --test.
+
+
+step2_create_agent.py
+
+1.It sets up a secure Azure AI project connection so the agent can access the approved knowledge base without embedding secrets.
+2.It defines a strict system prompt that forces the assistant to:
+	always use the approved corpus,
+	answer only from retrieved evidence,
+	cite real documents,
+	label confidence,
+	defer patient-specific clinical decisions,
+	avoid repeating PHI,
+	require clinician review when needed.
+3.It defines a strict JSON schema for the final agent response so outputs are structured and auditable.
+4.It creates a versioned Azure AI agent and attaches the knowledge base as an MCP tool.
+5.It requires tool use before responding, so the model cannot answer from memory alone.
+6.It includes a helper to ask the agent a question through the project and print the JSON response.
+In short, this file builds the “grounded clinical assistant” layer that sits on top of the knowledge base and enforces safety,
+ citation, and structured-response rules.
+ 
+ 
+ step3_assistant.py 
+ send a user question to the grounded agent,
+check whether the answer is safe to release,
+hold unsafe or unsupported answers in a clinician review queue,
+allow a clinician to review or approve the answer later,
+display the review status and final answer when the clinician decides.
+
+step4_evaluate.py 
+What this file does:
+runs the agent against a set of evaluation questions from the JSONL dataset,
+checks whether answers meet expected facts, citations, escalation behavior, and refusal requirements,
+handles answerable, deferral, adversarial, and out-of-corpus cases,
+optionally runs a cloud groundedness evaluation to confirm every claim is supported by retrieved context,
+reports pass/fail results and explains why a case failed so the prompt can be improved.
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------------------------------------------
+python -m py_compile step3_assistant.py. -- compile
+
+Added the summary field to step2_create_agent.py and summary display to step3_assistant.py. The additions are marked with fdeuser20 comments.
+
+The agent is instructed to produce a concise, evidence-grounded summary, and the response schema now requires it. The CLI displays the summary before an answer that passes review checks. It does not display summaries for held answers, so content from a held response isn’t exposed.
+
+Both files passed python -m py_compile. To activate and try the updated schema, recreate the agent with python step2_create_agent.py, then test a question using python step3_assistant.py "What does the sepsis pathway require in the first hour?".
+
+---------------------------------------------------------------------------------------------------
+
+
+Yes — this is the minimal, clean patch to add a summary field without changing the core retrieval or review flow.
+
+Patch for step2_create_agent.py
+
+Add the requirement in the instructions section
+Replace the response-format paragraph:
+
+8. RESPONSE FORMAT
+Return only an object satisfying the supplied JSON schema.
+Do not add text before or after the JSON response.
+The "answer" must never contain inline reference markers.
+All source information belongs in "citations".
+
+
+replace with:
+
+8. RESPONSE FORMAT
+Return only an object satisfying the supplied JSON schema.
+Do not add text before or after the JSON response.
+The "answer" must never contain inline reference markers.
+All source information belongs in "citations".
+Include a concise "summary" field with a plain-language 1-sentence summary of the answer.
+The "summary" must not contain inline citations or reference markers.
+
+
+
+2.Update the schema at the RESPONSE_SCHEMA block
+Replace:
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "answer",
+        "confidence",
+        "citations",
+        "requires_clinician_review",
+        "review_reason",
+    ],
+    "properties": {
+        "answer": {"type": "string"},
+        "confidence": {
+            "type": "string",
+            "enum": ["High", "Moderate", "Low"],
+        },
+        "citations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["document", "detail"],
+                "properties": {
+                    "document": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+            },
+        },
+        "requires_clinician_review": {"type": "boolean"},
+        "review_reason": {"type": "string"},
+    },
+}
+
+
+with:
+
+
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "answer",
+        "summary",
+        "confidence",
+        "citations",
+        "requires_clinician_review",
+        "review_reason",
+    ],
+    "properties": {
+        "answer": {"type": "string"},
+        "summary": {"type": "string"},
+        "confidence": {
+            "type": "string",
+            "enum": ["High", "Moderate", "Low"],
+        },
+        "citations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["document", "detail"],
+                "properties": {
+                    "document": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+            },
+        },
+        "requires_clinician_review": {"type": "boolean"},
+        "review_reason": {"type": "string"},
+    },
+}
+
+
+-------------------------------------------------------
+
+Patch for step3_assistant.py
+
+1. In the handle() function, preserve the summary if present:
+Replace:
+    if not hold:
+        return {"released": True, "result": result}
+
+    queued = dict(result)
+    queued["review_reason"] = result.get("review_reason") or reason
+	
+	
+	with:
+	
+	    if not hold:
+        return {"released": True, "result": result}
+
+    queued = dict(result)
+    queued["review_reason"] = result.get("review_reason") or reason
+    queued["summary"] = result.get("summary") or "Summary not available."
+
+
+2. In the CLI output for released answers, print the summary before the full answer:
+Replace:
+
+    if outcome["released"]:
+        print(result["answer"])
+
+        print(
+            f"\nConfidence: {result['confidence']}"
+        )
+		
+with:
+
+    if outcome["released"]:
+        print(f"Summary: {result.get('summary', 'Summary not available.')}")
+        print(result["answer"])
+
+        print(
+            f"\nConfidence: {result['confidence']}"
+        )
+		
+3. In the held-review output, include the summary too:
+Replace:
+
+        print(
+            "Held for clinician review - "
+            "not released to the requester."
+        )
+
+        print(
+            f"\nReason    : {outcome['reason']}"
+        )
+		
+with:
+
+        print(
+            "Held for clinician review - "
+            "not released to the requester."
+        )
+
+        if result.get("summary"):
+            print(f"\nSummary   : {result['summary']}")
+
+        print(
+            f"\nReason    : {outcome['reason']}"
+        )
+		
+		
+		
+Run: python step2_create_agent.py
+Then test: python step2_create_agent.py --ask "What does the sepsis pathway require in the first hour?"
+
+-----------------------------------------------------
+
+
+Reviewer feedback can be added without changing the agent prompt or response schema. 
+I’d capture a structured feedback category alongside the existing reviewer note and decision.
+
+1. Update review_queue.py
+Near the decision constants at the top of review_queue.py, add the available feedback categories:
+
+2. Add feedback selection in reviewer_app.py
+--------------------------------
+
+To test the feedback flow, use two PowerShell terminals from the project folder.
+
+1. Check Python syntax
+python -m py_compile review_queue.py reviewer_app.py
+
+
+Expected: no output and no error.
+
+2. Create a review item
+
+In the first terminal, submit a question that should be deferred, for example:
+python step3_assistant.py "What treatment should be chosen for a specific patient?"
+
+
+Expected: the answer is held for clinician review, and the CLI displays a review ID, for example:
+Held for clinician review - not released to the requester.
+...
+Review ID : <review-id>
+
+
+
+--------------3. Open the reviewer console
+
+In the second terminal:
+streamlit run reviewer_app.py
+
+Open the local URL Streamlit prints. Under Pending, open the new item. You should see a Feedback dropdown. Choose a category, add a note if useful, then click Approve, Approve with edits, or Reject.
+
+Expected: the console records the decision and refreshes. If you try to record a decision without selecting feedback, it should show:
+Select a feedback category before recording a decision.
+
+
+4. Verify the saved feedback
+
+Switch the console’s Show control to Decided. The item should appear with the selected feedback category in the feedback column, for example missing_information.
+
+
+
+-------------------------
+when you run streamlit run reviewer_app.py
+Streamlit starts a local web server and prints something like,
+Local URL: http://localhost:8501
+Network URL: http://192.168.x.x:8501
+
+Open the Local URL in your browser—usually http://localhost:8501. You can Ctrl+click it in the terminal, or copy and paste it into your browser’s address bar.
+
+
+
+
+--------------
+
+steps to test both the functionality:
+
+1. Recreate the agent so it uses the updated response schema:
+python step2_create_agent.py
+
+Ask a question that should produce a releasable answer:
+
+2. python step3_assistant.py "What does the sepsis pathway require in the first hour?"
+
+Confirm the output shows Summary: before the full answer. If the answer is held for clinician review, the summary should not be displayed.
+
+3. Confirm the output shows Summary: before the full answer. If the answer is held for clinician review, the summary should not be displayed.
+
+
+------------
+
+1.In a terminal, create a review item with a question that should be held:
+
+python step3_assistant.py "What treatment should be chosen for a specific patient?"
+
+Note the Review ID shown.
+
+2.In a second terminal, start the clinician review UI:
+streamlit run reviewer_app.py
+
+3. Open the Local URL Streamlit prints, usually http://localhost:8501. Under Pending, open the review item, choose a Feedback category, then click Approve, Approve with edits, or Reject.
+
+4.Switch Show to Decided and confirm the selected feedback appears in the table’s feedback column.
+
+5.After the clinician records a decision in the UI, switch Show to Decided and confirm the feedback appears in the table.
+
+6. Optionally check the item in PowerShell using its Review ID:
+
+
+python step3_assistant.py --status <REVIEW_ID>
+
+The status command shows the decision and final answer; the UI’s Decided view shows the feedback category.
+
+
+
+-------------------------------------------------
+
+total command to run for demo
+Copy and paste this block into PowerShell from the project folder. It runs setup, asks one answerable question, then asks a question intended for clinician review. When prompted, leave the first terminal open and use a second terminal for the review UI.
+
+# Check your Azure/lab configuration
+python lab_config.py
+
+# Create the knowledge source and knowledge base; wait for ingestion and its test query
+python step1_create_knowledge.py
+
+# Create the project connection and agent
+python step2_create_agent.py
+
+# Demo an answerable question
+python step3_assistant.py "What does the sepsis pathway require in the first hour?"
+
+# Demo a question intended to be held for clinician review
+python step3_assistant.py "Should this patient's treatment be changed based on their lab results?"
+
+# Copy the Review ID printed above, then check it after the reviewer has made a decision
+$reviewId = Read-Host "After the review is complete, enter the Review ID"
+python step3_assistant.py --status $reviewId
+
+# Run local behavior evaluation
+python step4_evaluate.py --local-only
+
+
+
+------
+When the held question prints its Review ID, open a second PowerShell terminal in the project folder and run:
+streamlit run reviewer_app.py
+
+Open the Local URL it prints, review the pending item, select a feedback category, and record a decision. Then return to the first terminal and enter the Review ID at the prompt.
+
+The selected feedback category appears in the reviewer UI’s Decided view. The --status command shows the decision and final answer, but not the feedback category.
+
+
